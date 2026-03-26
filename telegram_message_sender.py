@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 Telegram User Bot - Send Messages to Any Username
-This bot uses YOUR Telegram account (user client) to send messages to any public username.
-The bot itself is just a controller - the actual sending is done by your user account.
+Deployment-ready version for Render
 """
 
 import asyncio
 import os
 import json
 import sqlite3
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -29,17 +29,22 @@ from telegram.ext import (
     ContextTypes
 )
 
-# ==================== CONFIGURATION ====================
-# Your User Account Credentials (get from https://my.telegram.org/apps)
-API_ID = 1234567  # REPLACE WITH YOUR API ID
-API_HASH = "your_api_hash_here"  # REPLACE WITH YOUR API HASH
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Bot Token (from @BotFather)
-BOT_TOKEN = "your_bot_token_here"  # REPLACE WITH YOUR BOT TOKEN
+# ==================== CONFIGURATION ====================
+# Get credentials from environment variables (safer for deployment)
+API_ID = int(os.environ.get('API_ID', 0))
+API_HASH = os.environ.get('API_HASH', '')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 
 # Settings
-DELAY_SECONDS = 30  # Delay between messages
-DAILY_LIMIT = 50    # Maximum messages per day
+DELAY_SECONDS = int(os.environ.get('DELAY_SECONDS', 30))
+DAILY_LIMIT = int(os.environ.get('DAILY_LIMIT', 50))
 USER_SESSION_FILE = "user_session"
 
 # Conversation states
@@ -68,6 +73,7 @@ def init_database():
     
     conn.commit()
     conn.close()
+    logger.info("Database initialized")
 
 def log_sent_message(username, user_id, message, status, error=None):
     """Log a sent message to database"""
@@ -108,20 +114,26 @@ class UserMessageSender:
     def __init__(self):
         self.client = None
         self.is_connected = False
+        self.user_info = None
         
     async def connect(self):
         """Connect the user client"""
         try:
+            if not API_ID or not API_HASH:
+                return False, "❌ API_ID or API_HASH not configured in environment variables"
+                
             self.client = TelegramClient(USER_SESSION_FILE, API_ID, API_HASH)
             await self.client.start()
             
             if await self.client.is_user_authorized():
                 me = await self.client.get_me()
                 self.is_connected = True
+                self.user_info = me
                 return True, f"✅ Connected as: {me.first_name} (@{me.username})"
             else:
                 return False, "❌ Not authorized. Please check your API credentials."
         except Exception as e:
+            logger.error(f"Connection error: {e}")
             return False, f"❌ Connection failed: {str(e)}"
     
     async def disconnect(self):
@@ -156,6 +168,7 @@ class UserMessageSender:
         except RPCError as e:
             return False, f"❌ Telegram error: {str(e)}"
         except Exception as e:
+            logger.error(f"Send error: {e}")
             return False, f"❌ Error: {str(e)}"
     
     async def send_batch(self, usernames, message, progress_callback=None):
@@ -169,7 +182,7 @@ class UserMessageSender:
                 results.append({
                     'username': username,
                     'success': False,
-                    'error': f'Daily limit reached ({DAILY_LIMIT} messages/day)'
+                    'response': f'Daily limit reached ({DAILY_LIMIT} messages/day)'
                 })
                 continue
             
@@ -196,7 +209,7 @@ class UserMessageSender:
                 await progress_callback(i, len(usernames), result)
             
             # Add delay between messages (except last)
-            if i < len(usernames) and success:
+            if i < len(usernames):
                 await asyncio.sleep(DELAY_SECONDS)
         
         return results
@@ -242,14 +255,12 @@ This bot uses YOUR Telegram account to send messages to any public username!
     
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
-        help_text = """
+        help_text = f"""
 📚 **Help Guide**
 
 **Step 1: Connect Account**
 Use `/connect` to connect your Telegram account.
-You'll need:
-- API ID (from https://my.telegram.org/apps)
-- API HASH (from https://my.telegram.org/apps)
+The API credentials are already configured in the bot.
 
 **Step 2: Send Messages**
 Use `/send` and follow the prompts:
@@ -268,7 +279,7 @@ Message: "Hello! This is a test message"
 Usernames: user1, user2, user3
 
 ⚠️ **Important**: You can only message users who haven't blocked you or set privacy restrictions.
-        """.format(DAILY_LIMIT=DAILY_LIMIT, DELAY_SECONDS=DELAY_SECONDS)
+        """
         
         await update.message.reply_text(help_text)
     
@@ -283,12 +294,7 @@ Usernames: user1, user2, user3
         
         await update.message.reply_text(
             "🔐 **Connecting to your Telegram account...**\n\n"
-            "Please make sure you have:\n"
-            "1. API ID from https://my.telegram.org/apps\n"
-            "2. API HASH from the same place\n\n"
-            "⚠️ **Important**: This is a USER client, not a bot token!\n"
-            "You need to use your actual Telegram account credentials.\n\n"
-            "Starting connection process...",
+            "Please wait...",
             parse_mode='Markdown'
         )
         
@@ -302,13 +308,13 @@ Usernames: user1, user2, user3
         else:
             await update.message.reply_text(
                 f"❌ {message}\n\n"
-                "Please check your API credentials and try again with /connect"
+                "Please check your API credentials in the environment variables."
             )
     
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
         if self.user_sender.is_connected:
-            me = await self.user_sender.client.get_me()
+            me = self.user_sender.user_info
             today_count = get_today_count()
             
             status_text = f"""
@@ -332,7 +338,8 @@ Use /send to send more messages!
         else:
             await update.message.reply_text(
                 "❌ **Not connected**\n\n"
-                "Use /connect to connect your Telegram account first."
+                "Use /connect to connect your Telegram account first.",
+                parse_mode='Markdown'
             )
     
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -494,7 +501,8 @@ Remaining: {DAILY_LIMIT - today_count}
         await query.edit_message_text(
             "📤 **Sending messages...**\n\n"
             "Please wait, this may take a few minutes.\n"
-            "I'll notify you when complete."
+            "I'll notify you when complete.",
+            parse_mode='Markdown'
         )
         
         usernames = context.user_data['usernames']
@@ -510,7 +518,7 @@ Remaining: {DAILY_LIMIT - today_count}
                 status_msg += f"Progress: {current}/{total}\n"
                 status_msg += f"Success: {len([r for r in results if r['success']])}\n"
                 status_msg += f"Failed: {len([r for r in results if not r['success']])}"
-                await query.edit_message_text(status_msg)
+                await query.edit_message_text(status_msg, parse_mode='Markdown')
         
         results = await self.user_sender.send_batch(usernames, message, update_progress)
         
@@ -541,8 +549,17 @@ Remaining: {DAILY_LIMIT - today_count}
         return ConversationHandler.END
 
 # ==================== MAIN ====================
-def main():
+async def main():
     """Main function to run the bot"""
+    # Check if credentials are set
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not set in environment variables!")
+        return
+    
+    if not API_ID or not API_HASH:
+        logger.error("API_ID or API_HASH not set in environment variables!")
+        return
+    
     # Initialize database
     init_database()
     
@@ -572,9 +589,23 @@ def main():
     application.add_handler(conv_handler)
     
     # Start bot
-    print("🤖 Bot is starting...")
-    print("Press Ctrl+C to stop")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("🤖 Bot is starting...")
+    
+    # Use polling (works better for Render)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    logger.info("Bot is running! Press Ctrl+C to stop")
+    
+    # Keep the bot running
+    stop_signal = asyncio.Event()
+    await stop_signal.wait()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
