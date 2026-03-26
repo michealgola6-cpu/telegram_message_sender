@@ -1,0 +1,9 @@
+# Add one username per line (without @ symbol)
+# Lines starting with # are ignored
+
+# Example usernames:
+# friend_username
+# family_member
+# colleague_name
+
+# Add your usernames below:
