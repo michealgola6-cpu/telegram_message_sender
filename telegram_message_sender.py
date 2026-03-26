@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Telegram User Bot - Send Messages to Any Username
-Deployment-ready version for Render
+Your account is pre-configured - users just send message and usernames!
 """
 
 import asyncio
 import os
-import json
 import sqlite3
 import logging
 from datetime import datetime
@@ -37,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURATION ====================
-# Get credentials from environment variables (safer for deployment)
+# Your Telegram account credentials (get from https://my.telegram.org/apps)
 API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH', '')
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
@@ -48,7 +47,7 @@ DAILY_LIMIT = int(os.environ.get('DAILY_LIMIT', 50))
 USER_SESSION_FILE = "user_session"
 
 # Conversation states
-(ASKING_MESSAGE, ASKING_USERNAMES, CONFIRM_SEND) = range(3)
+(WAITING_MESSAGE, WAITING_USERNAMES, CONFIRM_SEND) = range(3)
 
 # ==================== DATABASE SETUP ====================
 def init_database():
@@ -56,17 +55,14 @@ def init_database():
     conn = sqlite3.connect('message_tracker.db')
     c = conn.cursor()
     
-    # Track sent messages
     c.execute('''CREATE TABLE IF NOT EXISTS sent_messages
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   recipient_username TEXT,
-                  recipient_id INTEGER,
                   message TEXT,
                   status TEXT,
                   sent_time TIMESTAMP,
                   error TEXT)''')
     
-    # Track daily stats
     c.execute('''CREATE TABLE IF NOT EXISTS daily_stats
                  (date TEXT PRIMARY KEY,
                   count INTEGER DEFAULT 0)''')
@@ -75,14 +71,14 @@ def init_database():
     conn.close()
     logger.info("Database initialized")
 
-def log_sent_message(username, user_id, message, status, error=None):
+def log_sent_message(username, message, status, error=None):
     """Log a sent message to database"""
     conn = sqlite3.connect('message_tracker.db')
     c = conn.cursor()
     c.execute('''INSERT INTO sent_messages 
-                 (recipient_username, recipient_id, message, status, sent_time, error)
-                 VALUES (?, ?, ?, ?, ?, ?)''',
-              (username, user_id, message, status, datetime.now(), error))
+                 (recipient_username, message, status, sent_time, error)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (username, message, status, datetime.now(), error))
     conn.commit()
     conn.close()
 
@@ -109,18 +105,18 @@ def increment_today_count():
 
 # ==================== TELEGRAM USER CLIENT ====================
 class UserMessageSender:
-    """Handles sending messages using the user account"""
+    """Handles sending messages using your Telegram account"""
     
     def __init__(self):
         self.client = None
         self.is_connected = False
-        self.user_info = None
         
     async def connect(self):
-        """Connect the user client"""
+        """Connect your Telegram account automatically"""
         try:
             if not API_ID or not API_HASH:
-                return False, "❌ API_ID or API_HASH not configured in environment variables"
+                logger.error("API_ID or API_HASH not configured!")
+                return False
                 
             self.client = TelegramClient(USER_SESSION_FILE, API_ID, API_HASH)
             await self.client.start()
@@ -128,19 +124,14 @@ class UserMessageSender:
             if await self.client.is_user_authorized():
                 me = await self.client.get_me()
                 self.is_connected = True
-                self.user_info = me
-                return True, f"✅ Connected as: {me.first_name} (@{me.username})"
+                logger.info(f"✅ Connected as: {me.first_name} (@{me.username})")
+                return True
             else:
-                return False, "❌ Not authorized. Please check your API credentials."
+                logger.error("❌ Authorization failed!")
+                return False
         except Exception as e:
             logger.error(f"Connection error: {e}")
-            return False, f"❌ Connection failed: {str(e)}"
-    
-    async def disconnect(self):
-        """Disconnect the user client"""
-        if self.client:
-            await self.client.disconnect()
-            self.is_connected = False
+            return False
     
     async def send_to_username(self, username, message):
         """Send a message to a username"""
@@ -157,7 +148,7 @@ class UserMessageSender:
             # Send message
             await self.client.send_message(entity, message)
             
-            return True, f"✅ Sent to {entity.first_name or 'User'} (@{username})"
+            return True, f"✅ Sent to @{username}"
             
         except UsernameNotOccupiedError:
             return False, f"❌ Username @{username} does not exist"
@@ -170,160 +161,110 @@ class UserMessageSender:
         except Exception as e:
             logger.error(f"Send error: {e}")
             return False, f"❌ Error: {str(e)}"
-    
-    async def send_batch(self, usernames, message, progress_callback=None):
-        """Send messages to multiple users"""
-        results = []
-        today_count = get_today_count()
-        successful = 0
-        failed = 0
-        
-        for i, username in enumerate(usernames, 1):
-            # Check daily limit
-            if today_count + i > DAILY_LIMIT:
-                results.append({
-                    'username': username,
-                    'success': False,
-                    'response': f'Daily limit reached ({DAILY_LIMIT} messages/day)'
-                })
-                failed += 1
-                continue
-            
-            # Send message
-            success, response = await self.send_to_username(username, message)
-            
-            result = {
-                'username': username,
-                'success': success,
-                'response': response
-            }
-            results.append(result)
-            
-            # Log the attempt
-            log_sent_message(username, None, message, 
-                            'success' if success else 'failed', 
-                            response if not success else None)
-            
-            if success:
-                increment_today_count()
-                successful += 1
-            else:
-                failed += 1
-            
-            # Call progress callback if provided
-            if progress_callback:
-                await progress_callback(i, len(usernames), result, successful, failed)
-            
-            # Add delay between messages (except last)
-            if i < len(usernames) and success:
-                await asyncio.sleep(DELAY_SECONDS)
-        
-        return results, successful, failed
 
 # ==================== BOT HANDLERS ====================
 class MessageBot:
     """Telegram bot handler"""
     
     def __init__(self):
-        self.user_sender = UserMessageSender()
+        self.sender = UserMessageSender()
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command - Start the message sending process"""
+        """Handle /start command"""
         welcome_text = """
-🤖 **Telegram Message Sender Bot**
+🤖 **Message Sender Bot**
 
-Welcome! I'll help you send messages to any Telegram username using your account.
+Send messages to any Telegram username using my account!
 
-**How it works:**
-1️⃣ You'll send me the message you want to send
-2️⃣ Then you'll provide the usernames (one per line or comma-separated)
-3️⃣ I'll send the message to each username and report back
+**How to use:**
+1️⃣ Send me the message you want to send
+2️⃣ Send me the usernames (one per line or comma-separated)
+3️⃣ I'll send the message and report back
 
 **Commands:**
-/start - Start the message sending process
-/connect - Connect your Telegram account (first time only)
-/status - Check connection and daily usage
-/stats - View message statistics
-/help - Show help message
+/start - Start sending messages
+/stats - View today's statistics
+/help - Show help
 
-⚠️ **Important**: Use responsibly to avoid account restrictions!
-        """
+**Example:**
+Message: "Hello! This is a test"
+Usernames: john_doe, jane_smith, username123
+
+⚠️ Rate limits: {DELAY_SECONDS}s delay, {DAILY_LIMIT} messages/day
+        """.format(DELAY_SECONDS=DELAY_SECONDS, DAILY_LIMIT=DAILY_LIMIT)
         
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
         
-        # Check if connected, if not, ask to connect first
-        if not self.user_sender.is_connected:
+        # Check if connected, if not, connect automatically
+        if not self.sender.is_connected:
             await update.message.reply_text(
-                "🔐 **First, let's connect your Telegram account.**\n\n"
-                "Please use /connect to authenticate your account.\n\n"
-                "Once connected, use /start again to begin sending messages.",
+                "🔐 Connecting to Telegram account...\n"
+                "Please wait a moment."
+            )
+            success = await self.sender.connect()
+            if success:
+                await update.message.reply_text(
+                    "✅ Account connected! Let's start.\n\n"
+                    "**Step 1: Send me your message**",
+                    parse_mode='Markdown'
+                )
+                return WAITING_MESSAGE
+            else:
+                await update.message.reply_text(
+                    "❌ Failed to connect. Please check the logs."
+                )
+                return ConversationHandler.END
+        else:
+            await update.message.reply_text(
+                "**Step 1: Send me your message**",
                 parse_mode='Markdown'
             )
-        else:
-            # If already connected, start the sending process
-            await self.ask_for_message(update, context)
+            return WAITING_MESSAGE
     
-    async def ask_for_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Ask user for the message to send"""
-        # Check daily limit first
+    async def receive_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive and save the message"""
+        message_text = update.message.text
+        
+        # Check daily limit
         today_count = get_today_count()
         if today_count >= DAILY_LIMIT:
             await update.message.reply_text(
-                f"⚠️ **Daily limit reached**\n\n"
-                f"You have sent {DAILY_LIMIT} messages today.\n"
+                f"⚠️ **Daily limit reached!**\n\n"
+                f"You've sent {DAILY_LIMIT} messages today.\n"
                 f"Please try again tomorrow.",
                 parse_mode='Markdown'
             )
             return ConversationHandler.END
         
-        await update.message.reply_text(
-            f"📝 **Step 1/2: Enter your message**\n\n"
-            f"Please send me the message you want to send to users.\n\n"
-            f"*Daily limit remaining: {DAILY_LIMIT - today_count} messages*\n"
-            f"*Delay between messages: {DELAY_SECONDS} seconds*\n\n"
-            f"Example: \"Hello! This is a test message\"",
-            parse_mode='Markdown'
-        )
-        
-        return ASKING_MESSAGE
-    
-    async def receive_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Receive and save the message from user"""
-        message_text = update.message.text
-        
-        # Store in context
+        # Store message
         context.user_data['message'] = message_text
         
         await update.message.reply_text(
             f"✅ **Message saved!**\n\n"
             f"Your message:\n\"{message_text}\"\n\n"
-            f"📝 **Step 2/2: Enter usernames**\n\n"
-            f"Now, send me the usernames you want to send this message to.\n\n"
-            f"**Format options:**\n"
-            f"• One username per line\n"
-            f"• Or comma-separated: user1, user2, user3\n\n"
-            f"**Don't include @ symbol**\n\n"
-            f"Example:\n"
-            f"john_doe\n"
-            f"jane_smith\n"
-            f"username123",
+            f"**Step 2: Send me the usernames**\n\n"
+            f"Format options:\n"
+            f"• One per line:\n"
+            f"  john_doe\n"
+            f"  jane_smith\n"
+            f"• Comma-separated:\n"
+            f"  john_doe, jane_smith, username123\n\n"
+            f"Don't include @ symbol\n\n"
+            f"*Remaining today: {DAILY_LIMIT - today_count} messages*",
             parse_mode='Markdown'
         )
         
-        return ASKING_USERNAMES
+        return WAITING_USERNAMES
     
     async def receive_usernames(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Receive and parse usernames, then send messages"""
+        """Receive usernames and send messages"""
         usernames_input = update.message.text
         
         # Parse usernames
         usernames = []
-        
-        # Try comma separation first
         if ',' in usernames_input:
             usernames = [u.strip().replace('@', '') for u in usernames_input.split(',') if u.strip()]
         else:
-            # Try line separation
             usernames = [line.strip().replace('@', '') for line in usernames_input.split('\n') if line.strip()]
         
         # Remove duplicates
@@ -333,24 +274,24 @@ Welcome! I'll help you send messages to any Telegram username using your account
             await update.message.reply_text(
                 "❌ No valid usernames found. Please try again with valid usernames."
             )
-            return ASKING_USERNAMES
+            return WAITING_USERNAMES
         
-        # Check against daily limit
+        # Check daily limit
         today_count = get_today_count()
         remaining = DAILY_LIMIT - today_count
         
         if len(usernames) > remaining:
             await update.message.reply_text(
                 f"⚠️ You have {len(usernames)} usernames but only {remaining} messages remaining today.\n\n"
-                f"Please try again with fewer recipients, or continue tomorrow.",
+                f"Please try again with fewer recipients.",
                 parse_mode='Markdown'
             )
-            return ASKING_USERNAMES
+            return WAITING_USERNAMES
         
-        # Store in context
+        # Store usernames
         context.user_data['usernames'] = usernames
         
-        # Show preview and ask for confirmation
+        # Show preview
         preview = f"**📋 Ready to send!**\n\n"
         preview += f"**Message:**\n\"{context.user_data['message']}\"\n\n"
         preview += f"**Recipients ({len(usernames)}):**\n"
@@ -362,14 +303,13 @@ Welcome! I'll help you send messages to any Telegram username using your account
             preview += f"... and {len(usernames) - 10} more\n"
         
         preview += f"\n**Estimated time:** ~{len(usernames) * DELAY_SECONDS / 60:.1f} minutes\n\n"
-        preview += f"⚠️ **Important**: Messages will be sent with a {DELAY_SECONDS} second delay between each to avoid rate limits.\n\n"
-        preview += f"**Do you want to proceed?**"
+        preview += f"**Send now?**"
         
         # Create confirmation keyboard
         keyboard = [
             [
-                InlineKeyboardButton("✅ Yes, Send Messages", callback_data="confirm"),
-                InlineKeyboardButton("❌ No, Cancel", callback_data="cancel")
+                InlineKeyboardButton("✅ Send", callback_data="send"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -383,59 +323,77 @@ Welcome! I'll help you send messages to any Telegram username using your account
         return CONFIRM_SEND
     
     async def handle_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle confirmation and send messages"""
+        """Send messages and report results"""
         query = update.callback_query
         await query.answer()
         
         if query.data == "cancel":
-            await query.edit_message_text("❌ Operation cancelled. Use /start to try again.")
+            await query.edit_message_text("❌ Cancelled. Use /start to try again.")
             return ConversationHandler.END
         
-        # Proceed with sending
+        # Start sending
         await query.edit_message_text(
             "📤 **Sending messages...**\n\n"
             "Please wait, this may take a few minutes.\n"
-            "I'll report back with the results shortly.\n\n"
-            "⏳ Processing...",
+            "I'll report back with results.",
             parse_mode='Markdown'
         )
         
         usernames = context.user_data['usernames']
         message = context.user_data['message']
         
-        # Send the messages and track progress
+        # Send messages one by one
         results = []
         successful = 0
         failed = 0
         
-        async def update_progress(current, total, result, success_count, fail_count):
-            # Update status message periodically
-            if current % 3 == 0 or current == total:
-                status_msg = f"📤 **Sending messages...**\n\n"
-                status_msg += f"Progress: {current}/{total}\n"
-                status_msg += f"✅ Successful: {success_count}\n"
-                status_msg += f"❌ Failed: {fail_count}\n\n"
-                status_msg += f"Last: @{result['username']} - {result['response'][:50]}"
-                await query.edit_message_text(status_msg, parse_mode='Markdown')
-        
-        results, successful, failed = await self.user_sender.send_batch(
-            usernames, message, update_progress
-        )
+        for i, username in enumerate(usernames, 1):
+            # Update progress
+            if i % 5 == 0 or i == len(usernames):
+                progress_msg = f"📤 **Sending...**\n\n"
+                progress_msg += f"Progress: {i}/{len(usernames)}\n"
+                progress_msg += f"✅ Sent: {successful}\n"
+                progress_msg += f"❌ Failed: {failed}\n"
+                await query.edit_message_text(progress_msg, parse_mode='Markdown')
+            
+            # Send the message
+            success, response = await self.sender.send_to_username(username, message)
+            
+            result = {
+                'username': username,
+                'success': success,
+                'response': response
+            }
+            results.append(result)
+            
+            # Log the attempt
+            log_sent_message(username, message, 'success' if success else 'failed', 
+                           response if not success else None)
+            
+            if success:
+                successful += 1
+                increment_today_count()
+            else:
+                failed += 1
+            
+            # Add delay between messages
+            if i < len(usernames):
+                await asyncio.sleep(DELAY_SECONDS)
         
         # Prepare final report
         report = f"✅ **Sending Complete!**\n\n"
-        report += f"**Summary:**\n"
-        report += f"📊 Total recipients: {len(usernames)}\n"
-        report += f"✅ Successfully sent: {successful}\n"
+        report += f"**Results:**\n"
+        report += f"📊 Total: {len(usernames)}\n"
+        report += f"✅ Successful: {successful}\n"
         report += f"❌ Failed: {failed}\n"
         
-        if successful > 0:
+        if len(usernames) > 0:
             success_rate = (successful / len(usernames)) * 100
-            report += f"📈 Success rate: {success_rate:.1f}%\n\n"
+            report += f"📈 Success Rate: {success_rate:.1f}%\n\n"
         
-        # Show successful sends (first 5)
+        # Show successful sends
         if successful > 0:
-            report += f"**✅ Successful sends ({successful}):**\n"
+            report += f"**✅ Successful ({successful}):**\n"
             success_list = [r for r in results if r['success']][:5]
             for r in success_list:
                 report += f"• @{r['username']}\n"
@@ -445,98 +403,28 @@ Welcome! I'll help you send messages to any Telegram username using your account
         
         # Show failed sends
         if failed > 0:
-            report += f"**❌ Failed sends ({failed}):**\n"
+            report += f"**❌ Failed ({failed}):**\n"
             failed_list = [r for r in results if not r['success']][:5]
             for r in failed_list:
-                report += f"• @{r['username']}: {r['response'][:50]}\n"
+                report += f"• @{r['username']}: {r['response']}\n"
             if failed > 5:
                 report += f"... and {failed - 5} more\n"
             report += "\n"
         
-        # Show remaining daily limit
+        # Show remaining limit
         remaining = DAILY_LIMIT - get_today_count()
-        report += f"**📊 Daily limit remaining:** {remaining}/{DAILY_LIMIT} messages\n\n"
-        
-        report += f"Use /start to send more messages!"
+        report += f"**📊 Remaining today:** {remaining}/{DAILY_LIMIT} messages\n\n"
+        report += f"Use /start to send more!"
         
         await query.edit_message_text(report, parse_mode='Markdown')
         
         return ConversationHandler.END
     
-    async def connect(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /connect command"""
-        # Check if already connected
-        if self.user_sender.is_connected:
-            me = self.user_sender.user_info
-            await update.message.reply_text(
-                f"✅ You are already connected as {me.first_name} (@{me.username})!\n\n"
-                f"Use /start to begin sending messages."
-            )
-            return
-        
-        await update.message.reply_text(
-            "🔐 **Connecting to your Telegram account...**\n\n"
-            "Please wait while I authenticate with your account.\n\n"
-            "This may take a moment...",
-            parse_mode='Markdown'
-        )
-        
-        success, message = await self.user_sender.connect()
-        
-        if success:
-            await update.message.reply_text(
-                f"✅ {message}\n\n"
-                f"Your account is now connected!\n\n"
-                f"Use /start to begin sending messages to any username!"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ {message}\n\n"
-                f"Please check your API credentials in the environment variables.\n\n"
-                f"Required variables:\n"
-                f"• API_ID\n"
-                f"• API_HASH\n"
-                f"• BOT_TOKEN",
-                parse_mode='Markdown'
-            )
-    
-    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /status command"""
-        if self.user_sender.is_connected:
-            me = self.user_sender.user_info
-            today_count = get_today_count()
-            
-            status_text = f"""
-📊 **Account Status**
-
-✅ **Connected**
-👤 Account: {me.first_name} (@{me.username})
-📱 User ID: {me.id}
-
-📈 **Today's Activity**
-Messages sent: {today_count}/{DAILY_LIMIT}
-Remaining: {DAILY_LIMIT - today_count}
-
-⚙️ **Settings**
-Delay between messages: {DELAY_SECONDS} seconds
-Daily limit: {DAILY_LIMIT} messages
-
-Use /start to send messages!
-            """
-            await update.message.reply_text(status_text, parse_mode='Markdown')
-        else:
-            await update.message.reply_text(
-                "❌ **Not connected**\n\n"
-                "Use /connect to connect your Telegram account first.\n\n"
-                "After connecting, use /start to begin sending messages.",
-                parse_mode='Markdown'
-            )
-    
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /stats command"""
+        """Show statistics"""
         today_count = get_today_count()
         
-        # Get last 10 messages
+        # Get recent messages
         conn = sqlite3.connect('message_tracker.db')
         c = conn.cursor()
         c.execute('''SELECT recipient_username, status, sent_time 
@@ -547,7 +435,7 @@ Use /start to send messages!
         conn.close()
         
         stats_text = f"""
-📊 **Message Statistics**
+📊 **Statistics**
 
 **Today**
 Messages: {today_count}/{DAILY_LIMIT}
@@ -568,77 +456,66 @@ Remaining: {DAILY_LIMIT - today_count}
         await update.message.reply_text(stats_text, parse_mode='Markdown')
     
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
+        """Help command"""
         help_text = f"""
-📚 **Help Guide**
+📚 **How to Use**
 
-**Quick Start:**
-1. First time: Use `/connect` to connect your Telegram account
-2. Then use `/start` to begin sending messages
-3. Follow the prompts:
-   • Enter your message
-   • Enter usernames (one per line or comma-separated)
-4. Confirm and send
+**1. Send your message**
+Just type any message you want to send
 
-**Commands:**
-/start - Start the message sending process
-/connect - Connect your Telegram account (first time only)
-/status - Check connection status and daily usage
-/stats - View your message sending history
-/help - Show this help message
-
-**Tips:**
-- Usernames can be entered without @ symbol
-- Maximum {DAILY_LIMIT} messages per day
-- {DELAY_SECONDS} seconds delay between messages
-- You can send to ANY public username (not just contacts)
-
-**Username Formats:**
+**2. Send usernames**
+Format options:
 • One per line:
   john_doe
   jane_smith
-  username123
-
+  
 • Comma-separated:
   john_doe, jane_smith, username123
 
-**Common Issues:**
-- "User has privacy restrictions": Some users have disabled messages from non-contacts
-- "Username does not exist": The username is invalid or doesn't exist
-- "Rate limited": Please wait and try again later
+**3. Confirm**
+Click "Send" to start sending
 
-⚠️ **Important**: Use responsibly to avoid account restrictions!
+**Commands:**
+/start - Start new message session
+/stats - View statistics
+/help - Show this help
+
+**Limits:**
+• {DELAY_SECONDS} seconds between messages
+• {DAILY_LIMIT} messages per day
+
+**Note:** Don't include @ symbol in usernames!
         """
         
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
 # ==================== MAIN ====================
 async def main():
-    """Main function to run the bot"""
-    # Check if credentials are set
+    """Main function"""
+    # Check credentials
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set in environment variables!")
+        logger.error("BOT_TOKEN not set!")
         return
     
     if not API_ID or not API_HASH:
-        logger.error("API_ID or API_HASH not set in environment variables!")
+        logger.error("API_ID or API_HASH not set!")
         return
     
-    # Initialize database
+    # Initialize
     init_database()
     
-    # Create bot instance
+    # Create bot
     message_bot = MessageBot()
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Create conversation handler for the sending flow
+    # Create conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', message_bot.start)],
         states={
-            ASKING_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, message_bot.receive_message)],
-            ASKING_USERNAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, message_bot.receive_usernames)],
+            WAITING_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, message_bot.receive_message)],
+            WAITING_USERNAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, message_bot.receive_usernames)],
             CONFIRM_SEND: [CallbackQueryHandler(message_bot.handle_confirmation)]
         },
         fallbacks=[CommandHandler('cancel', message_bot.help)],
@@ -647,8 +524,6 @@ async def main():
     
     # Add handlers
     application.add_handler(CommandHandler('start', message_bot.start))
-    application.add_handler(CommandHandler('connect', message_bot.connect))
-    application.add_handler(CommandHandler('status', message_bot.status))
     application.add_handler(CommandHandler('stats', message_bot.stats))
     application.add_handler(CommandHandler('help', message_bot.help))
     application.add_handler(conv_handler)
@@ -656,14 +531,20 @@ async def main():
     # Start bot
     logger.info("🤖 Bot is starting...")
     
-    # Use polling (works better for Render)
+    # Connect user account automatically
+    logger.info("🔐 Connecting to user account...")
+    if not await message_bot.sender.connect():
+        logger.error("❌ Failed to connect user account!")
+        return
+    
+    # Start polling
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
     
-    logger.info("Bot is running! Press Ctrl+C to stop")
+    logger.info("✅ Bot is running!")
     
-    # Keep the bot running
+    # Keep running
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
@@ -671,6 +552,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("Bot stopped")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
