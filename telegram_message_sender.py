@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Telegram Message Sender
-Uses Telethon to send messages from your account to specified usernames.
+Uses Telethon (User Client) to send messages from your account to any username.
+Works with ANY public username, not just contacts!
 Features:
+- Send to any username (contacts or non-contacts)
 - Secure authentication
 - Rate limiting with delays
 - Progress tracking
@@ -16,7 +18,6 @@ from datetime import datetime
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError, 
-    UserNotMutualContactError,
     UserPrivacyRestrictedError,
     UsernameNotOccupiedError,
     RPCError
@@ -86,7 +87,7 @@ class TelegramMessageSender:
         elif choice == "3":
             try:
                 with open("usernames.txt", "r") as f:
-                    usernames = [line.strip().replace("@", "") for line in f if line.strip()]
+                    usernames = [line.strip().replace("@", "") for line in f if line.strip() and not line.startswith('#')]
                 print(f"✅ Loaded {len(usernames)} usernames from file")
             except FileNotFoundError:
                 print("❌ usernames.txt not found!")
@@ -104,38 +105,28 @@ class TelegramMessageSender:
 
         return cleaned[:DAILY_LIMIT]  # Enforce daily limit
 
-    async def resolve_username(self, username):
-        """Resolve username to user entity"""
-        try:
-            entity = await self.client.get_entity(username)
-            if isinstance(entity, User) and not entity.bot:
-                return entity
-            return None
-        except UsernameNotOccupiedError:
-            return None
-        except Exception as e:
-            return None
-
-    async def send_message_with_delay(self, username, message, index, total):
-        """Send message to a single user with delay"""
+    async def resolve_and_send(self, username, message, index, total):
+        """Resolve username and send message - works with ANY public username!"""
         print(f"\n[{index}/{total}] Processing @{username}...")
 
-        # Resolve username
-        user = await self.resolve_username(username)
-        if not user:
-            print(f"   ❌ Failed: User @{username} not found or invalid")
-            self.stats['failed'] += 1
-            return False
-
-        # Check if user is in contacts (optional safety check)
         try:
+            # Telethon can resolve ANY public username, not just contacts
+            # This uses Telegram's username resolution API
+            entity = await self.client.get_entity(username)
+
+            if not isinstance(entity, User):
+                print(f"   ❌ Failed: @{username} is not a user (might be a channel/group)")
+                self.stats['failed'] += 1
+                return False
+
+            if entity.bot:
+                print(f"   ⚠️  Warning: @{username} is a bot, but will try to send anyway...")
+
             # Send the message
-            await self.client.send_message(user.id, message)
+            await self.client.send_message(entity, message)
 
-            # Get current time
             current_time = datetime.now().strftime("%H:%M:%S")
-
-            print(f"   ✅ Success! Message sent to {user.first_name} (@{username}) at {current_time}")
+            print(f"   ✅ Success! Message sent to {entity.first_name or 'User'} (@{username}) at {current_time}")
             self.stats['success'] += 1
 
             # Add delay if not the last message
@@ -145,6 +136,17 @@ class TelegramMessageSender:
 
             return True
 
+        except UsernameNotOccupiedError:
+            print(f"   ❌ Failed: Username @{username} does not exist")
+            self.stats['failed'] += 1
+            return False
+
+        except UserPrivacyRestrictedError:
+            print(f"   ❌ Failed: User @{username} has privacy settings that prevent messaging")
+            print(f"      💡 Tip: They may need to message you first or add you as contact")
+            self.stats['failed'] += 1
+            return False
+
         except FloodWaitError as e:
             wait_time = e.seconds
             print(f"   ⚠️  Rate limit hit! Need to wait {wait_time} seconds")
@@ -152,7 +154,8 @@ class TelegramMessageSender:
             await asyncio.sleep(wait_time)
             # Retry once after waiting
             try:
-                await self.client.send_message(user.id, message)
+                entity = await self.client.get_entity(username)
+                await self.client.send_message(entity, message)
                 print(f"   ✅ Success after waiting!")
                 self.stats['success'] += 1
                 return True
@@ -160,16 +163,6 @@ class TelegramMessageSender:
                 print(f"   ❌ Failed after waiting: {str(e2)}")
                 self.stats['failed'] += 1
                 return False
-
-        except UserPrivacyRestrictedError:
-            print(f"   ❌ Failed: User @{username} has privacy restrictions")
-            self.stats['failed'] += 1
-            return False
-
-        except UserNotMutualContactError:
-            print(f"   ❌ Failed: User @{username} is not a mutual contact")
-            self.stats['failed'] += 1
-            return False
 
         except RPCError as e:
             print(f"   ❌ Failed: Telegram error - {str(e)}")
@@ -197,9 +190,11 @@ class TelegramMessageSender:
         print(f"Total Messages:    {self.stats['total']}")
         print(f"Successful:        {self.stats['success']} ✅")
         print(f"Failed:            {self.stats['failed']} ❌")
-        print(f"Success Rate:      {(self.stats['success']/self.stats['total']*100):.1f}%")
+        if self.stats['total'] > 0:
+            print(f"Success Rate:      {(self.stats['success']/self.stats['total']*100):.1f}%")
         print(f"Duration:          {duration:.1f} seconds ({duration/60:.1f} minutes)")
-        print(f"Average per msg:   {duration/self.stats['total']:.1f} seconds")
+        if self.stats['total'] > 0:
+            print(f"Average per msg:   {duration/self.stats['total']:.1f} seconds")
         print("="*50)
 
     async def run(self):
@@ -207,8 +202,11 @@ class TelegramMessageSender:
         print("\n" + "="*50)
         print("TELEGRAM MESSAGE SENDER")
         print("="*50)
+        print("📱 This is a USER CLIENT (not a bot)")
+        print("✅ Can send to ANY public username")
+        print("✅ Works with contacts AND non-contacts")
         print("⚠️  WARNING: Use responsibly to avoid account restrictions!")
-        print(f"⚙️  Settings: {DAILY_LIMIT} max/day, {DELAY_SECONDS}s delay between messages")
+        print(f"⚙️  Settings: {DAILY_LIMIT} max/day, {DELAY_SECONDS}s delay")
         print("="*50)
 
         # Connect to Telegram
@@ -266,10 +264,12 @@ class TelegramMessageSender:
             print("\n" + "="*50)
             print("SENDING MESSAGES")
             print("="*50)
+            print("💡 Sending to ANY username (contacts or non-contacts)")
+            print("="*50)
 
             # Process each username
             for i, username in enumerate(usernames, 1):
-                await self.send_message_with_delay(username, message, i, len(usernames))
+                await self.resolve_and_send(username, message, i, len(usernames))
                 self.print_progress_bar(i, len(usernames))
 
             # Print final stats
@@ -300,10 +300,11 @@ def create_usernames_template():
     if not os.path.exists("usernames.txt"):
         with open("usernames.txt", "w") as f:
             f.write("# Add one username per line (without @)\n")
+            f.write("# These can be ANY public usernames, not just your contacts\n")
             f.write("# Example:\n")
-            f.write("username1\n")
-            f.write("username2\n")
-            f.write("username3\n")
+            f.write("# friend_username\n")
+            f.write("# customer_123\n")
+            f.write("# anyone_with_public_username\n")
         print("✅ Created usernames.txt template")
 
 
